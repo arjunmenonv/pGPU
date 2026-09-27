@@ -37,6 +37,7 @@ class MemoryAllocation:
     base_addr: int
     size: int
     index_modifier: Optional[Callable[[np.ndarray], np.ndarray]] = None
+    mem_space: str = "dram"
 
     def contains(self, word_addr):
         """Return True (or boolean mask array) if word_addr falls within [base_addr, base_addr + size)."""
@@ -53,6 +54,11 @@ class MemoryAllocation:
                 and self.index_modifier == other.index_modifier
             )
         return False
+
+
+class MemoryAccessError(MemoryError, ValueError):
+    """Raised when a memory load or store accesses a word address outside allocated buffers."""
+    pass
 
 
 class MemOpType(Enum):
@@ -150,7 +156,8 @@ class MemoryResource(AbstractResource):
         aligned_base = (self._next_alloc_base + 31) & ~31
         base_addr = aligned_base % (1 << 32)
         self._next_alloc_base = (base_addr + size) % (1 << 32)
-        allocation = MemoryAllocation(name=name, base_addr=base_addr, size=size)
+        space_tag = "sram" if "sram" in self.name.lower() else "dram"
+        allocation = MemoryAllocation(name=name, base_addr=base_addr, size=size, mem_space=space_tag)
         self.allocations[name] = allocation
         self.allocated_words += size
         return allocation
@@ -263,6 +270,24 @@ class MemoryResource(AbstractResource):
                 if token in queue:
                     queue.remove(token)
 
+    def validate_allocated_addresses(self, active_addrs: np.ndarray) -> None:
+        """
+        Verify that every active word address falls within at least one valid allocation
+        in `self.allocations`. Raises MemoryAccessError if any active address is unallocated.
+        """
+        addrs = np.asarray(active_addrs, dtype=np.int64)
+        if addrs.size == 0:
+            return
+        covered = np.zeros(addrs.shape, dtype=bool)
+        for alloc in self.allocations.values():
+            covered |= alloc.contains(addrs)
+        if not np.all(covered):
+            bad_addrs = addrs[~covered]
+            raise MemoryAccessError(
+                f"Out-of-bounds memory access in {self.name}: word address(es) {bad_addrs.tolist()} "
+                f"do not belong to any allocated buffer."
+            )
+
     def load(
         self,
         addresses: np.ndarray,
@@ -283,6 +308,7 @@ class MemoryResource(AbstractResource):
         """
         addrs = np.asarray(addresses, dtype=np.int64)
         mask_arr = np.ones(len(addrs), dtype=bool) if mask is None else np.asarray(mask, dtype=bool)
+        self.validate_allocated_addresses(addrs[mask_arr])
 
         phys_addrs = self.translate_addresses(addrs)
         active_indices = np.where(mask_arr)[0]
@@ -339,6 +365,7 @@ class MemoryResource(AbstractResource):
         addrs = np.asarray(addresses, dtype=np.int64)
         vals = np.asarray(values, dtype=np.float32)
         mask_arr = np.ones(len(addrs), dtype=bool) if mask is None else np.asarray(mask, dtype=bool)
+        self.validate_allocated_addresses(addrs[mask_arr])
 
         phys_addrs = self.translate_addresses(addrs)
         active_indices = np.where(mask_arr)[0]
