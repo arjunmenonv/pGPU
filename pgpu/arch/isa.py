@@ -747,13 +747,41 @@ class WarpKernel:
     Warp differentiation (address offsets, matrix partitioning) is achieved using
     hardware special registers (`kb.sr_warpid`, `kb.sr_laneid`, `kb.sr_numwarps`).
     """
-    def __init__(self, num_warps: int = 4):
+    def __init__(self, num_warps: int = 4, debug: bool = False):
         self.num_warps = num_warps
+        # TEMPORARY INTERNAL FEATURE: `debug` / `_print_live_regs` is for internal developer
+        # verification only and must not be exposed as the user-facing API. The user-facing
+        # interface will be `pgpu.devtools.objdump.objdump(kernel, reg_live_range=True)`
+        # (nvdisasm-style per-line register live range table).
+        self.debug = debug
         self.instructions: List[Instruction] = []
         self.labels: Dict[str, int] = {}
         self.allocator: RegisterAllocator = RegisterAllocator()
         self.sram: _KernelSRAMInterface = _KernelSRAMInterface(self)
         self._internal_id_counter: int = 0
+        self._scope_counter: int = 0
+        if self.debug:
+            print("=== WarpKernel Register Liveness Trace (debug=True) ===")
+            self._print_live_regs("Kernel start")
+
+    def _print_live_regs(self, stage: str = "") -> None:
+        """
+        [Temporary Internal Helper] Print currently live physical vector and predicate
+        registers when `self.debug` is True. To be replaced by `objdump(..., reg_live_range=True)`.
+        """
+        if not self.debug:
+            return
+        alloc = self.allocator
+        live_vregs = [f"R{i}" for i, is_used in enumerate(alloc.used) if is_used]
+        live_preds = [f"P{i}" for i, is_used in enumerate(alloc.pred_used) if is_used]
+        print(
+            f"  [{stage:<28}] "
+            f"alive_vregs={alloc.num_alive:2d}/64 {live_vregs} | "
+            f"alive_preds={alloc.num_preds_alive}/8 {live_preds} | "
+            f"next_reg_idx=R{alloc.next_reg_idx}"
+        )
+
+    print_live_regs = _print_live_regs
 
     def _next_internal_id(self) -> int:
         val = self._internal_id_counter
@@ -834,9 +862,18 @@ class WarpKernel:
                 name = args[0]
         return self.allocator.alloc_pred(name=name)
 
-    def reg_scope(self, *args: Any) -> RegScope:
+    def reg_scope(self, name: Optional[str] = None) -> RegScope:
         """Return a RegScope context manager for scoped register allocation."""
-        return RegScope(self.allocator)
+        if name is None or isinstance(name, int):
+            scope_name = f"scope_{self._scope_counter}"
+            self._scope_counter += 1
+        else:
+            scope_name = str(name)
+        return RegScope(
+            self.allocator,
+            name=scope_name,
+            debug_hook=self._print_live_regs if self.debug else None,
+        )
 
     def label(self, *args: Any) -> int:
         """Bind a symbolic jump label to the current instruction index. Accepts label_name."""

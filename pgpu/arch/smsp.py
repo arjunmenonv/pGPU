@@ -347,11 +347,15 @@ class RegisterAllocator:
 
 class RegScope:
     """Context manager that automatically frees any registers/tuples/predicates allocated within its block."""
-    def __init__(self, allocator: RegisterAllocator):
+    def __init__(self, allocator: RegisterAllocator, name: Optional[str] = None, debug_hook: Optional[Any] = None):
         self.allocator = allocator
+        self.name = name or "scope"
+        self._debug_hook = debug_hook
         self.allocated: List[Union[VirtualReg, VirtualRegTuple, VirtualPred]] = []
 
     def __enter__(self) -> "RegScope":
+        if self._debug_hook is not None:
+            self._debug_hook(f"Enter {self.name}")
         return self
 
     def alloc(self, name: Optional[str] = None) -> VirtualReg:
@@ -372,8 +376,12 @@ class RegScope:
         return p
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        if self._debug_hook is not None:
+            self._debug_hook(f"Inside {self.name} (pre-free)")
         for item in self.allocated:
             item.free()
+        if self._debug_hook is not None:
+            self._debug_hook(f"Exit {self.name} (post-free)")
 
 
 # ============================================================================
