@@ -9,6 +9,9 @@ All compute resources enforce:
    co-schedulable across independent units `VALU`, `GEMMCORE`, `TRANS` in SMSP).
 2. Latch Inputs at Issue, Commit Outputs at Retire (`instr.pending_writes` committed
    inside `instr.retire(current_cycle, warp_regs, warp_preds)`).
+
+Author: Arjun Vadakkeveedu (arjunmenonv@alumni.iitm.ac.in)
+September 2026
 """
 
 from __future__ import annotations
@@ -30,6 +33,7 @@ from pgpu.arch.isa import (
     SR_NUMWARPS_ID,
     SIMD_WIDTH,
 )
+
 from pgpu.arch.smsp import WarpState
 
 
@@ -296,15 +300,29 @@ class GEMMCoreResource(ComputeResource):
     8x16x8 Tensor Core Matrix Unit (`OpClass.GEMMCORE`) executing `MMA`, `MMRED_MAX`, `MMRED_MIN`.
     
     - Latency: 8 cycles, non-pipelined.
-    - Register Ownership Layout (Column-Major 8x8 Sub-Blocks of 4x8 Tiles):
-      * `a_tuple[0]` / `b_tuple[0]`: Rows 0..3, Cols 0..7   (4x8)
-      * `a_tuple[1]` / `b_tuple[1]`: Rows 4..7, Cols 0..7   (4x8)
-      * `a_tuple[2]` / `b_tuple[2]`: Rows 0..3, Cols 8..15  (4x8)
-      * `a_tuple[3]` / `b_tuple[3]`: Rows 4..7, Cols 8..15  (4x8)
-      * `c_tuple[0]` / `d_tuple[0]`: Rows 0..3, Cols 0..7   (4x8)
-      * `c_tuple[1]` / `d_tuple[1]`: Rows 4..7, Cols 0..7   (4x8)
     - Cooperative instruction: all 32 lanes participate in computing D(8x8), and `active_lane_mask`
       is applied at writeback when `Instruction.retire()` commits `pending_writes`.
+
+    Thread-Value Mapping for MMA Instruction:
+    
+    Both A and B use this 8x16 format composed of four 4x8 quads (Q00, Q10, Q01, Q11).
+    C and D stack two 4x8 quads vertically (Q00, Q10) for an 8x8 matrix.
+    
+    Order of passing registers is always COL-MAJOR: r(Q00), r(Q10), r(Q01), r(Q11)
+    Output: r(Q00), r(Q10)
+
+      <-------------- 8 -------------><-------------- 8 ------------->
+    ^ +-------------------------------+-------------------------------+
+    | | t0                     t7     | t0                     t7     |
+    4 | t8         Q00         t15    | t8         Q01         t15    |
+    | | t16                    t23    | t16                    t23    |
+    v | t24                    t31    | t24                    t31    |
+    ^ +-------------------------------+-------------------------------+
+    | | t0                     t7     | t0                     t7     |
+    4 | t8         Q10         t15    | t8         Q11         t15    |
+    | | t16                    t23    | t16                    t23    |
+    v | t24                    t31    | t24                    t31    |
+      +-------------------------------+-------------------------------+
     """
     DEFAULT_LATENCY: int = 8
 
@@ -381,12 +399,12 @@ class GEMMCoreResource(ComputeResource):
         C = self.unpack_8x8_operand(c_regs)   # (8, 8)
 
         match instr.opcode:
-            case OpCode.MMA:
+            case OpCode.AVX_MMA:
                 D = (A @ B.T + C).astype(np.float32)
-            case OpCode.MMRED_MAX:
+            case OpCode.AVX_MMRED_MAX:
                 pairwise_prod = A[:, None, :] * B[None, :, :]  # (8, 8, 16)
                 D = np.maximum(C, np.max(pairwise_prod, axis=2)).astype(np.float32)
-            case OpCode.MMRED_MIN:
+            case OpCode.AVX_MMRED_MIN:
                 pairwise_prod = A[:, None, :] * B[None, :, :]  # (8, 8, 16)
                 D = np.minimum(C, np.min(pairwise_prod, axis=2)).astype(np.float32)
             case _:
@@ -456,7 +474,7 @@ class TransResource(ComputeResource):
         n = self.extract_and_validate_n(n_vec)
         log2_n = int(round(math.log2(n)))
 
-        if instr.opcode == OpCode.TANH_FAST:
+        if instr.opcode == OpCode.AVX_TANH_FAST:
             return 6 + 3 * log2_n
         return 4 + int(math.ceil(1.5 * log2_n))
 
@@ -494,19 +512,19 @@ class TransResource(ComputeResource):
                 result = np.tanh(x).astype(np.float32)
             case OpCode.LOG_TRANS:
                 result = np.log(x).astype(np.float32)
-            case OpCode.EXP_FAST:
+            case OpCode.AVX_EXP_FAST:
                 n = self.extract_and_validate_n(_read_reg(warp_regs, instr.srcs[1], warp_id=wid))
                 result = exp_taylor(x, n=n)
-            case OpCode.SIN_FAST:
+            case OpCode.AVX_SIN_FAST:
                 n = self.extract_and_validate_n(_read_reg(warp_regs, instr.srcs[1], warp_id=wid))
                 result = sin_taylor(x, n=n)
-            case OpCode.COS_FAST:
+            case OpCode.AVX_COS_FAST:
                 n = self.extract_and_validate_n(_read_reg(warp_regs, instr.srcs[1], warp_id=wid))
                 result = cos_taylor(x, n=n)
-            case OpCode.TANH_FAST:
+            case OpCode.AVX_TANH_FAST:
                 n = self.extract_and_validate_n(_read_reg(warp_regs, instr.srcs[1], warp_id=wid))
                 result = tanh_taylor(x, n=n)
-            case OpCode.LOG_FAST:
+            case OpCode.AVX_LOG_FAST:
                 n = self.extract_and_validate_n(_read_reg(warp_regs, instr.srcs[1], warp_id=wid))
                 result = log_taylor(x, n=n)
             case _:

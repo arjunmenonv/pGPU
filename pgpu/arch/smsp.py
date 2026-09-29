@@ -6,6 +6,9 @@ Defines SM Sub-Partition (SMSP) hardware state tokens, register file structures,
 - VirtualReg / VirtualRegTuple / VirtualPred: Opaque handles to physical vector/predicate registers.
 - RegisterAllocator: Per-warp circular next-fit register allocator tracking live registers.
 - RegScope: Automatic lifetime context manager for scoped register allocation.
+
+Author: Arjun Vadakkeveedu (arjunmenonv@alumni.iitm.ac.in)
+September 2026
 """
 
 from dataclasses import dataclass, field
@@ -35,6 +38,8 @@ class WarpState(Enum):
 class RegScoreboardEntry:
     """
     Tracks an in-flight write to a destination register `(warp_id, reg_id)`.
+
+    Deviation from a real GPU: no read scoreboards maintained by the SMSP. why?
     
     Holding a reference to `producer_resource` allows the SMSP scoreboard decoder
     to emit the exact stall signal (`producer_resource.stall_signal`:
@@ -55,6 +60,7 @@ class RegScoreboardEntry:
 class RegisterFile:
     """
     Defines the architectural register file namespace, capacity limits, and special registers.
+    Now also owns the physical register file arrays for an SMSP.
     """
     NUM_VECTOR_REGS: int = 64        # R0 .. R63 -> IDs 0 .. 63
     RZ_ID: int = 64                  # Dedicated hardwired zero register RZ -> ID 64
@@ -64,6 +70,11 @@ class RegisterFile:
     PRED_BASE_ID: int = 68           # P0 .. P7  -> IDs 68 .. 75
     NUM_PRED_REGS: int = 8           # 8 predicate registers per warp
     SIMD_WIDTH: int = 32             # 32 lanes per warp
+
+    def __init__(self, num_warps: int = 4):
+        self.num_warps = num_warps
+        self.regs = np.zeros((num_warps, self.NUM_VECTOR_REGS, self.SIMD_WIDTH), dtype=np.float32)
+        self.preds = np.zeros((num_warps, self.NUM_PRED_REGS, self.SIMD_WIDTH), dtype=bool)
 
 
 # Module-level aliases for backwards compatibility
@@ -387,7 +398,7 @@ class RegScope:
 # ============================================================================
 # SMSP Hardware Model & Round-Robin Warp Scheduler
 # ============================================================================
-from pgpu.sw.driver import apply_context_switch_cost
+from pgpu.sw.driver import apply_context_switch
 
 
 @dataclass
@@ -400,10 +411,10 @@ class WarpContext:
     state: WarpState = WarpState.WARP_READY
     at_barrier: bool = False
     completed: bool = False
-    # Local register file: R0..R63
-    regs: np.ndarray = field(default_factory=lambda: np.zeros((RegisterFile.NUM_VECTOR_REGS, RegisterFile.SIMD_WIDTH), dtype=np.float32))
-    # Local predicate file: P0..P7
-    preds: np.ndarray = field(default_factory=lambda: np.zeros((RegisterFile.NUM_PRED_REGS, RegisterFile.SIMD_WIDTH), dtype=bool))
+    # Local register file view: R0..R63
+    regs: np.ndarray = field(init=False)
+    # Local predicate file view: P0..P7
+    preds: np.ndarray = field(init=False)
     # Active register scoreboard mapping reg_id -> RegScoreboardEntry
     scoreboard: Dict[int, RegScoreboardEntry] = field(default_factory=dict)
     # Registers skipped during context save due to in-flight long-latency operations
@@ -444,9 +455,15 @@ class SMSP:
         self.num_warps = num_warps
         self.warp_id_offset = warp_id_offset
         self.total_warps = total_warps if total_warps is not None else num_warps
-        self.warps: List[WarpContext] = [
-            WarpContext(warp_id=self.warp_id_offset + w) for w in range(num_warps)
-        ]
+        self.register_file = RegisterFile(num_warps=num_warps)
+
+        self.warps: List[WarpContext] = []
+        for w in range(num_warps):
+            warp = WarpContext(warp_id=self.warp_id_offset + w)
+            warp.regs = self.register_file.regs[w]
+            warp.preds = self.register_file.preds[w]
+            self.warps.append(warp)
+            
         self._warp_map: Dict[int, WarpContext] = {w.warp_id: w for w in self.warps}
 
         # Memory resource pointers (decoupled from instantiation; wired via bind_memory or constructor)
@@ -466,6 +483,10 @@ class SMSP:
 
         # In-flight instructions tracking: list of (warp_id, clone)
         self.in_flight_instructions: List[Tuple[int, "Instruction"]] = []
+
+        # Optional instruction trace hook: called with (warp_id, clone_instr) after every issue
+        # Set to a callable to record trace data; None by default (no overhead).
+        self.trace_hook: Optional[Any] = None
 
     def bind_memory(
         self,
@@ -499,9 +520,14 @@ class SMSP:
         self.total_context_switch_cycles = 0
         self.context_switch_count = 0
         self.in_flight_instructions.clear()
-        self.warps = [
-            WarpContext(warp_id=self.warp_id_offset + w) for w in range(self.num_warps)
-        ]
+        self.register_file.regs.fill(0)
+        self.register_file.preds.fill(0)
+        self.warps = []
+        for w in range(self.num_warps):
+            warp = WarpContext(warp_id=self.warp_id_offset + w)
+            warp.regs = self.register_file.regs[w]
+            warp.preds = self.register_file.preds[w]
+            self.warps.append(warp)
         self._warp_map = {w.warp_id: w for w in self.warps}
         self.valu.reset()
         self.gemm.reset()
@@ -543,8 +569,26 @@ class SMSP:
         if instr.opcode == OpCode.YIELD:
             return WarpState.WARP_YIELD, self.current_cycle
 
-        if instr.opcode in (OpCode.SYNC, OpCode.SYNC_WARP):
+        if instr.opcode == OpCode.SYNC:
             return WarpState.WARP_BARRIER_STALL, self.current_cycle
+
+        if instr.opcode == OpCode.SYNC_WARP:
+            # Memory fence: Wait for all pending loads and stores for this warp to complete
+            pending_mem = [
+                clone for wid, clone in self.in_flight_instructions
+                if wid == warp.warp_id and clone.op_class in (OpClass.DRAM, OpClass.SRAM)
+            ]
+            if pending_mem:
+                unblock = max(
+                    (c.completion_time for c in pending_mem if c.completion_time is not None),
+                    default=self.current_cycle
+                )
+                if unblock > self.current_cycle:
+                    # Treat memory fence stall identically to a long-latency memory load stall
+                    return WarpState.WARP_LONG_LAT_STALL, unblock
+            
+            # Fence resolved: all memory ops complete. It proceeds as a 1-cycle no-op.
+            return WarpState.WARP_READY, self.current_cycle
 
         # 1. Scoreboard RAW Dependency Check (srcs and guard pred)
         stalling_entries: List[RegScoreboardEntry] = []
@@ -573,14 +617,21 @@ class SMSP:
         # 3. Structural Resource Availability Check
         res = self._get_resource_for_instruction(instr)
         if res is not None:
-            from pgpu.arch.memory import MemoryResource
+            from pgpu.arch.memory import MemoryResource, MemOpType
+            from pgpu.arch.valu import _read_reg
             if isinstance(res, MemoryResource):
-                if instr.opcode in (OpCode.DRAM_LD, OpCode.SRAM_LD):
-                    if not res.is_load_available(self.current_cycle):
-                        return res.stall_signal, res.next_available_load_cycle
-                elif instr.opcode in (OpCode.DRAM_ST, OpCode.SRAM_ST):
-                    if not res.is_store_available(self.current_cycle):
-                        return res.stall_signal, res.next_available_store_cycle
+                mask = instr.active_lane_mask(warp.preds)
+                addr_vec = _read_reg(warp.regs, instr.srcs[0], warp_id=warp.warp_id, num_warps=self.total_warps).astype(np.int64)
+                op_t = MemOpType.LOAD if instr.opcode in (OpCode.DRAM_LD, OpCode.SRAM_LD) else MemOpType.STORE
+                mem_state, mem_unblock = res.check_ready(
+                    op_type=op_t,
+                    addresses=addr_vec,
+                    current_cycle=self.current_cycle,
+                    warp_id=warp.warp_id,
+                    mask=mask,
+                )
+                if mem_state != WarpState.WARP_READY:
+                    return mem_state, mem_unblock
             elif not res.is_available(self.current_cycle):
                 return res.stall_signal, res.next_available_cycle
 
@@ -637,8 +688,9 @@ class SMSP:
                 res: MemoryResource = self.dram if instr.op_class == OpClass.DRAM else self.sram
                 mask = clone.active_lane_mask(warp.preds)
                 # Address vector read from src 0 (for LD) or src 1 (for ST)
+                from pgpu.arch.valu import _read_reg
                 if instr.opcode in (OpCode.DRAM_LD, OpCode.SRAM_LD):
-                    addr_vec = warp.regs[instr.srcs[0]].astype(np.int64)
+                    addr_vec = _read_reg(warp.regs, instr.srcs[0], warp_id=warp.warp_id, num_warps=self.total_warps).astype(np.int64)
                     _, comp, tokens, results = res.load(
                         addr_vec, current_cycle=self.current_cycle, warp_id=warp.warp_id, mask=mask
                     )
@@ -649,8 +701,8 @@ class SMSP:
                     completion_cycle = comp
                 else:
                     # STORE: dest=[], srcs=[src_addr, src_val]
-                    addr_vec = warp.regs[instr.srcs[0]].astype(np.int64)
-                    val_vec = warp.regs[instr.srcs[1]]
+                    addr_vec = _read_reg(warp.regs, instr.srcs[0], warp_id=warp.warp_id, num_warps=self.total_warps).astype(np.int64)
+                    val_vec = _read_reg(warp.regs, instr.srcs[1], warp_id=warp.warp_id, num_warps=self.total_warps)
                     _, comp, tokens = res.store(
                         addr_vec, val_vec, current_cycle=self.current_cycle, warp_id=warp.warp_id, mask=mask
                     )
@@ -672,7 +724,13 @@ class SMSP:
                 )
                 warp.scoreboard[d] = entry
 
+        if clone.completion_time is None:
+            clone.completion_time = completion_cycle
         self.in_flight_instructions.append((warp.warp_id, clone))
+
+        # Fire the optional instruction trace hook
+        if self.trace_hook is not None:
+            self.trace_hook(warp.warp_id, warp.pc, clone, self.current_cycle)
 
         # Advance PC or branch
         if instr.opcode == OpCode.JMP and clone.branch_taken:
@@ -733,7 +791,7 @@ class SMSP:
                 warp_ptr = (warp_ptr + 1) % len(active_warps)
                 next_wid = active_warps[warp_ptr].warp_id
                 if self.last_active_warp is not None and self.last_active_warp != next_wid:
-                    cost = apply_context_switch_cost(self, self.last_active_warp, next_wid)
+                    cost = apply_context_switch(self, self.last_active_warp, next_wid)
                     self.current_cycle += cost
                     self.total_context_switch_cycles += cost
                     self.context_switch_count += 1
@@ -746,7 +804,7 @@ class SMSP:
                 warp_ptr = (warp_ptr + 1) % len(active_warps)
                 next_wid = active_warps[warp_ptr].warp_id
                 if self.last_active_warp is not None and self.last_active_warp != next_wid:
-                    cost = apply_context_switch_cost(self, self.last_active_warp, next_wid)
+                    cost = apply_context_switch(self, self.last_active_warp, next_wid)
                     self.current_cycle += cost
                     self.total_context_switch_cycles += cost
                     self.context_switch_count += 1
@@ -758,7 +816,7 @@ class SMSP:
                 warp_ptr = (warp_ptr + 1) % len(active_warps)
                 next_wid = active_warps[warp_ptr].warp_id
                 if self.last_active_warp is not None and self.last_active_warp != next_wid:
-                    cost = apply_context_switch_cost(self, self.last_active_warp, next_wid)
+                    cost = apply_context_switch(self, self.last_active_warp, next_wid)
                     self.current_cycle += cost
                     self.total_context_switch_cycles += cost
                     self.context_switch_count += 1
@@ -789,9 +847,9 @@ class SMSP:
                 continue
 
             if state == WarpState.WARP_READY:
-                # Context switch penalty if warp changed
+                # Context switch penalty if previous warp completed (no context switch performed)
                 if self.last_active_warp is not None and self.last_active_warp != warp.warp_id:
-                    cost = apply_context_switch_cost(self, self.last_active_warp, warp.warp_id)
+                    cost = apply_context_switch(self, self.last_active_warp, warp.warp_id)
                     self.current_cycle += cost
                     self.total_context_switch_cycles += cost
                     self.context_switch_count += 1
@@ -799,7 +857,17 @@ class SMSP:
 
                 # Issue instruction
                 instr = program[warp.pc]
-                self.issue(warp, instr)
+                if self.trace_hook is not None:
+                    # In trace mode: catch DRAM/SRAM bounds errors so we still record
+                    # the instruction stream even when running with dummy allocations.
+                    from pgpu.arch.memory import MemoryAccessError
+                    try:
+                        self.issue(warp, instr)
+                    except MemoryAccessError:
+                        warp.pc += 1
+                else:
+                    self.issue(warp, instr)
+
                 self.current_cycle += 1
                 continue
 

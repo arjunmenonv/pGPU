@@ -4,14 +4,17 @@ Device-Level Intrinsics & Helper Functions for pGPU Kernels.
 Provides reusable in-kernel device functions (such as `memset`) that emit
 instruction sequences into a `WarpKernel` builder using scoped temporary registers.
 
-Location: pgpu/sw/intrinsics.py
+Author: Arjun Vadakkeveedu (arjunmenonv@alumni.iitm.ac.in)
+September 2026
 """
 
-from typing import List, Optional, Union, TYPE_CHECKING
+from typing import List, Optional, Union, TYPE_CHECKING, Any
+from pgpu.arch.isa import DEFAULT_TAYLOR_N
 
 if TYPE_CHECKING:
-    from pgpu.arch.isa import Instruction, WarpKernel
+    from pgpu.arch.isa import Instruction
     from pgpu.arch.memory import MemoryAllocation
+    from pgpu.sw.kernel import WarpKernel
 
 
 def memset(
@@ -26,14 +29,14 @@ def memset(
     on a DRAMResource or SRAMResource allocation by emitting a stream of stores.
 
     Addressing pattern:
-    - Uses standard linear addressing across threads within a warp (`0..31` contiguous offsets,
-      which is uncoalesced for DRAM in this architecture):
+    - Uses standard linear addressing across threads within a warp (`0..31` contiguous offsets):
         `tid = SR_WARPID * 32 + SR_LANEID`
     - Grid-stride increment per loop iteration:
         `stride = SR_NUMWARPS * 32`
     - Guarded by `p_cond = (idx < limit)` so non-multiple sizes are masked cleanly.
     """
     from pgpu.arch.memory import MemoryAllocation
+    from pgpu.sw.kernel import WarpKernel
 
     if isinstance(target, MemoryAllocation):
         base_addr = target.base_addr
@@ -88,3 +91,23 @@ def memset(
 
 # Alias
 emit_memset = memset
+
+def emit_fast_trans(
+    kb: "WarpKernel",
+    func_name: str,
+    dest: Any,
+    src_x: Any,
+    n: int = DEFAULT_TAYLOR_N,
+    pred: Optional[Union["VirtualPred", int]] = None,
+) -> List["Instruction"]:
+    """
+    Intrinsic wrapper for `<func>.fast.<n>`: emits `set.imm r_n, n` followed by
+    `<func>.fast dest, src_x, r_n` using a scoped temporary register.
+    """
+    with kb.reg_scope() as scope:
+        r_n = scope.alloc(name=f"{func_name}_n")
+        # Hardware validation requires all 32 lanes of R_n to hold the identical Taylor count,
+        # so this set.imm MUST NOT be predicated.
+        i_imm = kb.asm("set.imm", r_n, int(n), pred=None)
+        i_op = kb.asm(f"avx.{func_name.lower()}.fast", dest, src_x, r_n, pred=pred)
+        return [i_imm, i_op]
