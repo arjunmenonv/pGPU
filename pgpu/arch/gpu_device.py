@@ -6,7 +6,7 @@ Defines the 3-tier pGPU Hardware Device Hierarchy:
 - pGPU: Top-level GPU device housing 1 shared DRAMResource and multiple SMs
 
 Author: Arjun Vadakkeveedu (arjunmenonv@alumni.iitm.ac.in)
-Refactored & Extended: September 2026
+September 2026
 """
 
 from enum import Enum
@@ -26,6 +26,13 @@ class CopyDirection(Enum):
     D2H = "D2H"  # Device (DRAMResource) to Host (NumPy)
 
 
+# ============================================================================
+# Architectural Parameter Buffer in DRAM
+# ============================================================================
+PARAM_BUFFER_BASE: int = 0
+PARAM_BUFFER_SIZE: int = 1024
+
+
 class AbstractResource:
     """
     Abstract base class for a hardware resource in the pGPU simulator.
@@ -43,7 +50,7 @@ class AbstractResource:
     def InstrRetireRoutine(self, *args, **kwargs):
         """
         Resource-side cleanup routine triggered by `Instruction.retire()` for each
-        resource in `instruction.resources` (LLVM MachineScheduler style).
+        resource in `instruction.resources`.
         """
         pass
 
@@ -65,7 +72,7 @@ class SM:
     - A pointer to the enclosing `pGPU`'s `DRAMResource`.
     
     Architectural Note:
-        The current pGPU architecture supports **only 1 SMSP per SM** (`SMSPS_PER_SM = 1`).
+        The current pGPU architecture supports **only 1 SMSP per SM** (`SMSPS_PER_SM = 1`) due to ISA and SM Simulator limitations.
         The `SM` class serves as a structural abstraction decoupling the `SMSP` from
         `SRAMResource` ownership and providing an extension point for future multi-SMSP models.
     """
@@ -198,6 +205,10 @@ class pGPU:
             ]
 
         self._wire_hierarchy()
+        
+        # Register the architectural parameter buffer in DRAM (0..PARAM_BUFFER_SIZE-1)
+        if "__param_buffer__" not in self.dram.allocations:
+            self.dram.alloc("__param_buffer__", size=PARAM_BUFFER_SIZE)
 
     def _wire_hierarchy(self) -> None:
         """Wire shared DRAM to all SMs/SMSPs and configure device-wide warp numbering."""
@@ -321,29 +332,72 @@ class pGPU:
     # ========================================================================
     # Kernel Launch Interface
     # ========================================================================
-    def launch(self, program_or_kernel: Any) -> int:
+    def launch(self, compiled_kernel: Any, *args: Any) -> int:
         """
-        Launch an SPMD `WarpKernel` (or `List[Instruction]`) across all SMs and SMSPs in the pGPU.
+        Launch an SPMD Kernel on `device` with dynamic arguments.
         
-        1. Resolves jump labels and extracts static shared memory (`sram.alloc`) descriptors.
-        2. Registers static shared memory allocations on each SM's `SRAMResource`.
-        3. Resets compute state on all SMSPs (preserving DRAM and static SRAM allocations) and runs.
-        Returns the total elapsed device cycles.
+        1. Validates argument count against compiled kernel parameters.
+        2. Writes argument values (DRAM allocation base addresses or numeric scalars)
+           into the device's DRAM parameter buffer.
+        3. Registers in-kernel SRAM allocations with each SM's SRAMResource,
+           and writes their runtime SRAM base addresses into the parameter buffer.
+        4. Executes the kernel across all SMs and SMSPs.
+        5. Invokes driver epilogue cleanup to clear SRAM allocations.
+        Returns total elapsed simulation cycles.
         """
-        if hasattr(program_or_kernel, "get_program"):
-            program = program_or_kernel.get_program()
-        else:
-            program = program_or_kernel
+        from pgpu.arch.memory import MemoryAllocation
+        from pgpu.sw.driver import cleanup_sram
 
+        arg_names = getattr(compiled_kernel, "arg_names", [])
+        if len(args) != len(arg_names):
+            raise TypeError(
+                f"Kernel expected {len(arg_names)} arguments ({arg_names}), got {len(args)}."
+            )
+
+        # 1. Ensure parameter buffer is allocated in device DRAM
+        if "__param_buffer__" not in self.dram.allocations:
+            self.dram.alloc("__param_buffer__", size=PARAM_BUFFER_SIZE)
+
+        # 2. Extract values for kernel arguments
+        param_values: List[float] = []
+        for arg in args:
+            if isinstance(arg, MemoryAllocation):
+                param_values.append(float(arg.base_addr))
+            elif isinstance(arg, (int, float, np.integer, np.floating)):
+                param_values.append(float(arg))
+            else:
+                raise TypeError(f"Unsupported kernel argument type {type(arg)}: {arg!r}")
+
+        # 3. Clean and map SRAM allocations across all SMs, and extract their base addresses
+        cleanup_sram(self)
+        for sm in self.sms:
+            if hasattr(compiled_kernel, "sram_interface") and compiled_kernel.sram_interface is not None:
+                compiled_kernel.sram_interface.apply_to_sram(sm.sram)
+
+        # Append runtime SRAM tile base addresses to the parameter values
+        sram_bindings = getattr(compiled_kernel, "sram_bindings", [])
+        for name, _ in sram_bindings:
+            if name in self.sm.sram.allocations:
+                param_values.append(float(self.sm.sram.allocations[name].base_addr))
+            else:
+                raise KeyError(f"SRAM allocation '{name}' not found on device.")
+
+        # 4. Populate DRAM parameter buffer
+        for slot_idx, val in enumerate(param_values):
+            self.dram.memory[PARAM_BUFFER_BASE + slot_idx] = float(val)
+
+        # 5. Run compute state on all SMSPs
         max_cycles = 0
         for sm in self.sms:
-            if hasattr(program, "sram_interface") and program.sram_interface is not None:
-                program.sram_interface.apply_to_sram(sm.sram)
             for smsp in sm.smsps:
                 smsp.reset()
-                cycles = smsp.run(program)
+                cycles = smsp.run(compiled_kernel)
                 if cycles > max_cycles:
                     max_cycles = cycles
+
+        # 6. Epilogue: cleanup SRAM allocations via driver function
+        cleanup_sram(self)
+
         return max_cycles
 
     run = launch
