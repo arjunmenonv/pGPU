@@ -9,10 +9,17 @@ import unittest
 import numpy as np
 
 from pgpu.arch.gpu_device import CopyDirection, SM, pGPU
-from pgpu.arch.isa import WarpKernel
+from pgpu.arch.isa import Instruction
+from pgpu.sw.kernel import WarpKernel
 from pgpu.arch.memory import DRAMResource, MemoryAccessError, SRAMResource
 from pgpu.arch.smsp import SMSP
-from pgpu.examples.vector_add import build_vector_add_kernel, run_vector_add
+from pgpu.examples.vector_add import (
+    build_batched_vector_add_sram_kernel,
+    build_vector_add_kernel,
+    run_batched_vector_add_sram,
+    run_vector_add,
+)
+from pgpu.sw.driver import cleanup_sram
 from pgpu.sw.intrinsics import memset
 
 
@@ -169,6 +176,70 @@ class TestVectorAddAndDeviceHierarchy(unittest.TestCase):
 
         with self.assertRaises(MemoryAccessError):
             device.launch(kb)
+
+    def test_batched_vector_add_sram_matches_numpy(self):
+        """
+        Verify that batched vector add A (N x 32) + B (32) caching B in SRAM
+        matches reference NumPy implementation.
+        """
+        num_rows = 64
+        w_cols = 32
+        a = np.random.randn(num_rows, w_cols).astype(np.float32)
+        b = np.random.randn(w_cols).astype(np.float32)
+
+        c, cycles = run_batched_vector_add_sram(a, b, num_warps=4)
+
+        expected = a + b[None, :]
+        self.assertGreater(cycles, 0)
+        np.testing.assert_allclose(c, expected, rtol=1e-5, atol=1e-5)
+
+    def test_dynamic_kernel_relaunch_without_recompiling(self):
+        """
+        Verify that a single CompiledKernel can be launched multiple times with different
+        DRAM allocations without needing to be recompiled or rebuilt.
+        """
+        device = pGPU(num_sms=1, num_smsps_per_sm=1, num_warps_per_smsp=4)
+        compiled = build_vector_add_kernel(num_warps=4)
+
+        for run_idx in range(3):
+            n = 256
+            a_data = np.random.randn(n).astype(np.float32)
+            b_data = np.random.randn(n).astype(np.float32)
+
+            buf_a = device.dram_alloc(f"a_run_{run_idx}", n)
+            buf_b = device.dram_alloc(f"b_run_{run_idx}", n)
+            buf_c = device.dram_alloc(f"c_run_{run_idx}", n)
+
+            device.dram_copy(buf_a, a_data, direction=CopyDirection.H2D)
+            device.dram_copy(buf_b, b_data, direction=CopyDirection.H2D)
+
+            cycles = device.launch(compiled, buf_a, buf_b, buf_c, n)
+            self.assertGreater(cycles, 0)
+
+            c_out = device.dram_copy(buf_c, direction=CopyDirection.D2H)
+            np.testing.assert_allclose(c_out, a_data + b_data, rtol=1e-5, atol=1e-5)
+
+    def test_sram_epilogue_driver_cleanup(self):
+        """
+        Verify that launch automatically invokes cleanup_sram driver epilogue,
+        ensuring all SM static SRAM allocations are freed after kernel execution.
+        """
+        device = pGPU(num_sms=1, num_smsps_per_sm=1, num_warps_per_smsp=4)
+        num_rows = 16
+        w_cols = 32
+        a = np.random.randn(num_rows, w_cols).astype(np.float32)
+        b = np.random.randn(w_cols).astype(np.float32)
+
+        # Before launch, SRAM has no user allocations
+        for sm in device.sms:
+            self.assertEqual(len(sm.sram.allocations), 0)
+
+        run_batched_vector_add_sram(a, b, num_warps=4, device=device)
+
+        # After launch, driver cleanup epilogue should have reclaimed SRAM allocations
+        for sm in device.sms:
+            self.assertEqual(len(sm.sram.allocations), 0)
+            self.assertEqual(sm.sram.allocated_words, 0)
 
 
 if __name__ == "__main__":
