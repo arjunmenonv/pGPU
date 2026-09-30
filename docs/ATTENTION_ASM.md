@@ -143,7 +143,7 @@ The following points are gated by the official AI usage and honor code for the C
 
 `pGPU` Simulator: [arjunmenonv/pGPU](https://github.com/arjunmenonv/pGPU/tree/main/)
 
-docs: [TO-DO]
+docs: [docs](https://github.com/arjunmenonv/pGPU/tree/main/docs)
 
 example kernels: [vector-add](https://github.com/arjunmenonv/pGPU/tree/main/pgpu/examples/vector_add.py), [intrinsic-demo](https://github.com/arjunmenonv/pGPU/tree/main/pgpu/examples/intrinsic_demo.py)
 
