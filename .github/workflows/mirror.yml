@@ -1,0 +1,31 @@
+name: Mirror Private Repo to Public Repo
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout private repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Git identity
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+      - name: Push to public repository
+        env:
+          PUBLIC_REPO: github.com/arjunmenonv/pGPU.git
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          # Add the public repo as a second remote using the PAT
+          git remote add public https://${PAT_TOKEN}@${PUBLIC_REPO}
+          # Force-push the main branch to the public repo
+          git push public +refs/heads/main:refs/heads/main
