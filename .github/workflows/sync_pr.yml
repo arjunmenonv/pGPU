@@ -1,78 +1,40 @@
-name: Sync Public Issues → Private Repo
+name: Sync Public PRs → Private Repo
 
 on:
-  issues:
-    types: [opened, edited, closed, reopened]
+  push:
+    branches:
+      - main
+  pull_request:
+    types: [closed]
+    branches:
+      - main
+  workflow_dispatch:
 
 jobs:
   sync:
-    if: github.repository == 'arjunmenonv/pGPU'
+    if: >-
+      ${{
+        github.repository == 'arjunmenonv/pGPU' &&
+        (github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.merged == true))
+      }}
     runs-on: ubuntu-latest
     env:
-      PRIVATE_REPO: https://github.com/arjunmenonv/pGPU-private.git
+      PRIVATE_REPO: github.com/arjunmenonv/pGPU-private.git
       PRIVATE_PAT: ${{ secrets.PRIVATE_PAT }}
+
     steps:
-      - name: Checkout private repo
+      - name: Checkout public repository
         uses: actions/checkout@v4
         with:
-          repository: arjunmenonv/pGPU-private
-          token: ${{ secrets.PRIVATE_PAT }}
-          path: private-repo
           fetch-depth: 0
+          persist-credentials: false
 
-      - name: Install jq
-        run: sudo apt-get update && sudo apt-get install -y jq
-
-      - name: Determine source issue ID
-        id: src
-        env:
-          ISSUE_NUMBER: ${{ github.event.issue.number }}
+      - name: Configure Git identity
         run: |
-          MAPPING=$(curl -s -H "Authorization: token $PRIVATE_PAT" \
-                     -H "Accept: application/vnd.github+json" \
-                     "https://api.github.com/repos/${{ github.repository }}/issues/${ISSUE_NUMBER}/comments" |
-                     jq -r '.[] | select(.body|starts_with("↩️ Private‑issue:")) | .body' || true)
-          if [[ -n "$MAPPING" ]]; then
-            PRIVATE_ID=$(echo "$MAPPING" | cut -d: -f2 | tr -d " ")
-            echo "private_id=$PRIVATE_ID" >> $GITHUB_OUTPUT
-          fi
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
 
-      - name: Create or update corresponding private issue
-        env:
-          GH_TOKEN: ${{ secrets.PRIVATE_PAT }}
-          ISSUE_TITLE: ${{ github.event.issue.title }}
-          ISSUE_BODY: ${{ github.event.issue.body }}
-          ISSUE_STATE: ${{ github.event.issue.state }}
-          ISSUE_NUMBER: ${{ github.event.issue.number }}
-          PRIVATE_ID: ${{ steps.src.outputs.private_id }}
-          PRIVATE_REPO_PATH: arjunmenonv/pGPU-private
+      - name: Add private remote and force-push
         run: |
-          # Write body to file to handle multiline markdown safely
-          echo "$ISSUE_BODY" > issue_body.txt
-
-          if [[ -z "$PRIVATE_ID" ]]; then
-            # No mapping yet → create a new private issue
-            resp=$(gh api -X POST \
-               -H "Accept: application/vnd.github+json" \
-               /repos/$PRIVATE_REPO_PATH/issues \
-               -f title="$ISSUE_TITLE" \
-               -F body=@issue_body.txt)
-            NEW_ID=$(echo "$resp" | jq -r '.number')
-            
-            # Save mapping in public repo
-            echo "↩️ Private‑issue: $NEW_ID" | \
-              gh api -X POST \
-                 -H "Accept: application/vnd.github+json" \
-                 /repos/${{ github.repository }}/issues/${ISSUE_NUMBER}/comments \
-                 -F body=@-
-            echo "Created private issue #$NEW_ID"
-          else
-            # Mapping exists → update title/body and state
-            gh api -X PATCH \
-               -H "Accept: application/vnd.github+json" \
-               /repos/$PRIVATE_REPO_PATH/issues/$PRIVATE_ID \
-               -f title="$ISSUE_TITLE" \
-               -F body=@issue_body.txt \
-               -f state="$ISSUE_STATE"
-            echo "Updated private issue #$PRIVATE_ID"
-          fi
+          git remote add private https://${PRIVATE_PAT}@${PRIVATE_REPO}
+          git push private +refs/heads/main:refs/heads/main
