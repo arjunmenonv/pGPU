@@ -77,9 +77,9 @@ The simulator uses a naive round-robin scheduling algorithm to switch between wa
 
 ### Software Ecosystem and Tooling
 
-- `pGPU` exposes an assembly like interface for programming the simulated ISA. Check out the `assemble_instruction` function in [pgpu/sw/kernel.py](https://github.com/arjunmenonv/pGPU/blob/arjun/dev_branch/pgpu/sw/kernel.py) for the asm syntax and the `WarpKernel.asm()` function in the same file for inserting inline assembly into your kernel. An example vector-add kernel is provided in [pgpu/examples/vector_add.py](https://github.com/arjunmenonv/pGPU/blob/arjun/dev_branch/pgpu/examples/vector_add.py).
+- `pGPU` exposes an assembly like interface for programming the simulated ISA. Check out the `assemble_instruction` function in [pgpu/sw/kernel.py](https://github.com/arjunmenonv/pGPU/tree/main/pgpu/sw/kernel.py) for the asm syntax and the `WarpKernel.asm()` function in the same file for inserting inline assembly into your kernel. An example vector-add kernel is provided in [pgpu/examples/vector_add.py](https://github.com/arjunmenonv/pGPU/tree/main/pgpu/examples/vector_add.py).
 
-- It is recommended to use and develop intrinsic functions (or rather pre-defined inline-asm blocks) to wrap commonly used `pPTX` asm routines in your kernel. This will avoid clutter in your kernel and will simplify your optimization workflow. You can find some in-built intrinsic functions in [pgpu/sw/intrinsics.py](https://github.com/arjunmenonv/pGPU/blob/arjun/dev_branch/pgpu/sw/intrinsics.py).
+- It is recommended to use and develop intrinsic functions (or rather pre-defined inline-asm blocks) to wrap commonly used `pPTX` asm routines in your kernel. This will avoid clutter in your kernel and will simplify your optimization workflow. You can find some in-built intrinsic functions in [pgpu/sw/intrinsics.py](https://github.com/arjunmenonv/pGPU/tree/main/pgpu/sw/intrinsics.py).
 
 - The simulator comes with an `objdump` tool and a perfetto-compatible `KernelTrace` tool. 
     
@@ -87,7 +87,7 @@ The simulator uses a naive round-robin scheduling algorithm to switch between wa
         
     - `KernelTrace` traces the simulation of your kernel and generates a json file that you can open with [perfetto](https://ui.perfetto.dev/) to see an `nsight-systems` timeline-like view of your kernel execution
 
-- Finally, the entire source-code of the simulator is made available to you. You are encouraged to tinker with the [pgpu/sw](https://github.com/arjunmenonv/pGPU/blob/arjun/dev_branch/pgpu/sw) and [pgpu/devtools](https://github.com/arjunmenonv/pGPU/blob/arjun/dev_branch/pgpu/devtools) folders to add tools to simplify your workflow. 
+- Finally, the entire source-code of the simulator is made available to you. You are encouraged to tinker with the [pgpu/sw](https://github.com/arjunmenonv/pGPU/tree/main/pgpu/sw) and [pgpu/devtools](https://github.com/arjunmenonv/pGPU/tree/main/pgpu/devtools) folders to add tools to simplify your workflow. 
 
 ### Pre-empted FAQs
 
@@ -112,9 +112,9 @@ The simulator uses a naive round-robin scheduling algorithm to switch between wa
 
 #### 3. How should I approach this problem?
 
-1. Read the [docs]() (TBD) and go through the files in the [pgpu/sw](https://github.com/arjunmenonv/pGPU/blob/arjun/dev_branch/pgpu/sw) folder to get a hold of the simulator features and the software APIs around it.
+1. Read the [docs]() (TBD) and go through the files in the [pgpu/sw](https://github.com/arjunmenonv/pGPU/tree/main/pgpu/sw) folder to get a hold of the simulator features and the software APIs around it.
 
-2. Read the [ISA](https://github.com/arjunmenonv/pGPU/blob/arjun/dev_branch/pgpu/arch/isa.py)! You might find unconventional instructions here that might come in handy for your kernel.
+2. Read the [ISA](https://github.com/arjunmenonv/pGPU/tree/main/pgpu/arch/isa.py)! You might find unconventional instructions here that might come in handy for your kernel.
 
 3. Repeat the traditional kernel performance optimization loop: Build Hypotheses for Performance Bottlenecks $\rightarrow$ Implement Optimization $\rightarrow$  Trace and Inspect ASM $\rightarrow$ Validate Hypothesis. The simulator workflow here allows to iterate over this faster than in the real-world.
 
@@ -141,11 +141,11 @@ The following points are gated by the official AI usage and honor code for the C
 
 ## Relevant Links
 
-`pGPU` Simulator: [arjunmenonv/pGPU](https://github.com/arjunmenonv/pGPU/tree/arjun/dev_branch)
+`pGPU` Simulator: [arjunmenonv/pGPU](https://github.com/arjunmenonv/pGPU/tree/main/)
 
 docs: [TO-DO]
 
-example kernels: [vector-add](https://github.com/arjunmenonv/pGPU/blob/arjun/dev_branch/pgpu/examples/vector_add.py), [intrinsic-demo](https://github.com/arjunmenonv/pGPU/blob/arjun/dev_branch/pgpu/examples/intrinsic_demo.py)
+example kernels: [vector-add](https://github.com/arjunmenonv/pGPU/tree/main/pgpu/examples/vector_add.py), [intrinsic-demo](https://github.com/arjunmenonv/pGPU/tree/main/pgpu/examples/intrinsic_demo.py)
 
 
 <hr style="opacity: 0.6;">
