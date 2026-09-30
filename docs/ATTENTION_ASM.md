@@ -141,7 +141,7 @@ The following points are gated by the official AI usage and honor code for the C
 
 ## Relevant Links
 
-`pGPU` Simulator: [arjunmenonv/pGPU](https://github.com/arjunmenonv/pGPU/tree/arjun/dev_branch)
+`pGPU` Simulator: [arjunmenonv/pGPU](https://github.com/arjunmenonv/pGPU/tree/main/)
 
 docs: [TO-DO]
 
