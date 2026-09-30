@@ -13,7 +13,7 @@ jobs:
       PRIVATE_PAT: ${{ secrets.PRIVATE_PAT }}
     steps:
       - name: Checkout private repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: arjunmenonv/pGPU-private
           token: ${{ secrets.PRIVATE_PAT }}
