@@ -37,6 +37,7 @@ class MemoryAllocation:
     base_addr: int
     size: int
     index_modifier: Optional[Callable[[np.ndarray], np.ndarray]] = None
+    mem_space: str = "dram"
 
     def contains(self, word_addr):
         """Return True (or boolean mask array) if word_addr falls within [base_addr, base_addr + size)."""
@@ -55,6 +56,11 @@ class MemoryAllocation:
         return False
 
 
+class MemoryAccessError(MemoryError, ValueError):
+    """Raised when a memory load or store accesses a word address outside allocated buffers."""
+    pass
+
+
 class MemOpType(Enum):
     """Integer enum token identifying memory operation type in the Load-Store Queue."""
     LOAD = 0
@@ -65,19 +71,20 @@ class MemOpType(Enum):
 class InFlightMemOp:
     """
     Tracks an in-flight memory operation (MemOpType.LOAD or MemOpType.STORE) in the per-thread LSQ.
-    Pointers to these tokens (one per lane) are held in `instr.mem_tokens` so that
-    `MemoryResource.InstrRetireRoutine(warp_id, mem_tokens)` can remove them directly.
-    
-    Attributes:
-        resource (MemoryResource): Target MemoryResource instance.
-        op_type (MemOpType): Operation type token (`MemOpType.LOAD` or `MemOpType.STORE`).
-        address (int): Physical 32-bit word address accessed by this thread.
-        completion_time (int): Simulation cycle when the memory operation completes.
+    Models the 2-stage pipelined memory execution (`issue` -> `perform_request`):
+      - `is_issued`: True once Stage 1 (`issue`, duration `base_latency`) has completed at `issued_cycle`.
+      - `is_requested` (`is_retired`): True once Stage 2 (`perform_request`, duration `N_reqs * request_latency`)
+        has completed at `completion_time`.
     """
     resource: "MemoryResource"
     op_type: MemOpType
     address: int
     completion_time: int
+    issue_start_cycle: int = 0
+    issued_cycle: int = 0
+    req_start_cycle: int = 0
+    is_issued: bool = False
+    is_requested: bool = False
 
     def __post_init__(self):
         if not isinstance(self.resource, MemoryResource):
@@ -86,6 +93,20 @@ class InFlightMemOp:
             )
         if not isinstance(self.op_type, MemOpType):
             raise TypeError(f"op_type must be a MemOpType Enum token, got {self.op_type!r}")
+
+    @property
+    def is_retired(self) -> bool:
+        """Alias: a request is retired from the memory subsystem once `perform_request` completes."""
+        return self.is_requested
+
+    def advance_state(self, current_cycle: int) -> None:
+        """Update `is_issued` and `is_requested` (`is_retired`) based on `current_cycle`."""
+        if current_cycle >= self.issued_cycle:
+            self.is_issued = True
+        if current_cycle >= self.completion_time:
+            if not self.is_issued:
+                raise RuntimeError("perform_request cannot complete before instruction is_issued.")
+            self.is_requested = True
 
 
 # Alias for backward compatibility
@@ -125,9 +146,13 @@ class MemoryResource(AbstractResource):
         self.allocated_words: int = 0
         self._next_alloc_base: int = 0
 
-        # Independent full-duplex (bidirectional) read and write pipe timestamps
+        # Independent full-duplex 2-stage pipeline timestamps:
+        # Stage 1 (`issue`): when the current op becomes `is_issued = True` so the next op can issue
         self.next_available_load_cycle: int = 0
         self.next_available_store_cycle: int = 0
+        # Stage 2 (`perform_request`): when the current op finishes serialized request service (`is_requested = True`)
+        self.next_available_load_req_cycle: int = 0
+        self.next_available_store_req_cycle: int = 0
 
         # Unified 16-entry per-thread Load-Store Queue:
         # self.lsq[warp_id][lane_id] = list[InFlightMemOp]
@@ -150,7 +175,8 @@ class MemoryResource(AbstractResource):
         aligned_base = (self._next_alloc_base + 31) & ~31
         base_addr = aligned_base % (1 << 32)
         self._next_alloc_base = (base_addr + size) % (1 << 32)
-        allocation = MemoryAllocation(name=name, base_addr=base_addr, size=size)
+        space_tag = "sram" if "sram" in self.name.lower() else "dram"
+        allocation = MemoryAllocation(name=name, base_addr=base_addr, size=size, mem_space=space_tag)
         self.allocations[name] = allocation
         self.allocated_words += size
         return allocation
@@ -178,9 +204,61 @@ class MemoryResource(AbstractResource):
         """
         return np.asarray(addresses, dtype=np.int64)
 
+    def compute_issue_latency(self) -> int:
+        """Return Stage 1 (`issue`) constant pipeline latency (`base_latency`)."""
+        return self.base_latency
+
+    def compute_request_latency(self, addresses: np.ndarray) -> int:
+        """Compute Stage 2 (`perform_request`) serialized request latency. Implemented by subclasses."""
+        raise NotImplementedError("Subclasses of MemoryResource must implement compute_request_latency()")
+
     def compute_latency(self, addresses: np.ndarray) -> int:
-        """Compute access latency for a vector of active lane addresses. Implemented by subclasses."""
-        raise NotImplementedError("Subclasses of MemoryResource must implement compute_latency()")
+        """Compute total isolated access latency (`issue` + `perform_request`)."""
+        addrs = np.asarray(addresses)
+        if addrs.size == 0:
+            return self.compute_issue_latency()
+        return self.compute_issue_latency() + self.compute_request_latency(addrs)
+
+    def issue_request(self, op_type: MemOpType, start_cycle: int) -> Tuple[int, int, bool]:
+        """
+        Stage 1 (`issue`): Reserve the load/store issue stage for `base_latency` cycles.
+        Once `issued_cycle = issue_start + base_latency` is reached, `is_issued` becomes True,
+        allowing the next instruction to enter `issue` at `issued_cycle` and allowing this
+        instruction to enter `perform_request`.
+        """
+        issue_lat = self.compute_issue_latency()
+        if op_type == MemOpType.LOAD:
+            issue_start = self.reserve_load(start_cycle, duration=issue_lat)
+        else:
+            issue_start = self.reserve_store(start_cycle, duration=issue_lat)
+        issued_cycle = issue_start + issue_lat
+        is_issued = True
+        return issue_start, issued_cycle, is_issued
+
+    def perform_request(
+        self,
+        op_type: MemOpType,
+        issued_cycle: int,
+        is_issued: bool,
+        req_lat: int,
+    ) -> Tuple[int, int, bool]:
+        """
+        Stage 2 (`perform_request`): Execute serialized memory requests (`DRAM_REQ`s or SRAM waves).
+        Requires `is_issued == True` (enforcing `issue` preceding `perform_request`) and waits
+        until the previous operation's `perform_request` finishes (`next_available_*_req_cycle`).
+        """
+        if not is_issued:
+            raise RuntimeError("perform_request cannot execute unless is_issued is True.")
+        if op_type == MemOpType.LOAD:
+            req_start = max(issued_cycle, self.next_available_load_req_cycle)
+            completion_cycle = req_start + req_lat
+            self.next_available_load_req_cycle = completion_cycle
+        else:
+            req_start = max(issued_cycle, self.next_available_store_req_cycle)
+            completion_cycle = req_start + req_lat
+            self.next_available_store_req_cycle = completion_cycle
+        is_requested = True
+        return req_start, completion_cycle, is_requested
 
     def _evaluate_lsq_hazards(
         self,
@@ -226,13 +304,18 @@ class MemoryResource(AbstractResource):
         self,
         op_type: MemOpType,
         phys_addrs: np.ndarray,
+        issue_start_cycle: int,
+        issued_cycle: int,
+        req_start_cycle: int,
         completion_cycle: int,
+        is_issued: bool,
+        is_requested: bool,
         warp_id: int,
         active_indices: np.ndarray,
     ) -> List[Optional[InFlightMemOp]]:
         """
-        Create `InFlightMemOp` tokens for all active lanes, append them to `self.lsq[warp_id][lane_id]`,
-        and return the 32-element token pointer list (`InFlightMemOp` or `None` per lane).
+        Create `InFlightMemOp` tokens for all active lanes with 2-stage pipeline metadata,
+        append them to `self.lsq[warp_id][lane_id]`, and return the 32-element token pointer list.
         """
         mem_tokens: List[Optional[InFlightMemOp]] = [None] * len(phys_addrs)
         for lane_id in active_indices:
@@ -242,6 +325,11 @@ class MemoryResource(AbstractResource):
                 op_type=op_type,
                 address=int(phys_addrs[l_id]),
                 completion_time=completion_cycle,
+                issue_start_cycle=issue_start_cycle,
+                issued_cycle=issued_cycle,
+                req_start_cycle=req_start_cycle,
+                is_issued=is_issued,
+                is_requested=is_requested,
             )
             self.lsq[warp_id][l_id].append(token)
             mem_tokens[l_id] = token
@@ -254,14 +342,74 @@ class MemoryResource(AbstractResource):
     ):
         """
         Resource-specific retirement routine invoked by `Instruction.retire()`.
-        Takes `warp_id` and `mem_tokens` (a 32-element list, one `InFlightMemOp` token
-        or `None` per lane) and removes the retired token from `self.lsq[warp_id][lane_id]`.
+        Marks tokens as `is_issued = True` and `is_requested = True` (`is_retired = True`)
+        and removes the retired token from `self.lsq[warp_id][lane_id]`.
         """
         for lane_id, token in enumerate(mem_tokens):
             if token is not None and token.resource is self:
+                token.is_issued = True
+                token.is_requested = True
                 queue = self.lsq[warp_id][lane_id]
                 if token in queue:
                     queue.remove(token)
+
+    def validate_allocated_addresses(self, active_addrs: np.ndarray) -> None:
+        """
+        Verify that every active word address falls within at least one valid allocation
+        in `self.allocations`. Raises MemoryAccessError if any active address is unallocated.
+        """
+        addrs = np.asarray(active_addrs, dtype=np.int64)
+        if addrs.size == 0:
+            return
+        covered = np.zeros(addrs.shape, dtype=bool)
+        for alloc in self.allocations.values():
+            covered |= alloc.contains(addrs)
+        if not np.all(covered):
+            bad_addrs = addrs[~covered]
+            raise MemoryAccessError(
+                f"Out-of-bounds memory access in {self.name}: word address(es) {bad_addrs.tolist()} "
+                f"do not belong to any allocated buffer."
+            )
+
+    def check_ready(
+        self,
+        op_type: MemOpType,
+        addresses: np.ndarray,
+        current_cycle: int,
+        warp_id: int = 0,
+        mask: Optional[np.ndarray] = None,
+    ) -> Tuple[WarpState, int]:
+        """
+        Non-mutating readiness check for `decode_warp_state`: evaluates LSQ capacity,
+        intra-thread RAW (`STORE -> LOAD`) hazards, and Stage 1 (`issue`) availability.
+        """
+        addrs = np.asarray(addresses, dtype=np.int64)
+        mask_arr = np.ones(len(addrs), dtype=bool) if mask is None else np.asarray(mask, dtype=bool)
+        phys_addrs = self.translate_addresses(addrs)
+        active_indices = np.where(mask_arr)[0]
+
+        if op_type == MemOpType.LOAD:
+            max_queue_full_stall, max_raw_ready = self._evaluate_lsq_hazards(
+                phys_addrs=phys_addrs,
+                current_cycle=current_cycle,
+                warp_id=warp_id,
+                active_indices=active_indices,
+                conflicting_op_type=MemOpType.STORE,
+            )
+            unblock_cycle = max(current_cycle, max_queue_full_stall, max_raw_ready, self.next_available_load_cycle)
+        else:
+            max_queue_full_stall, _ = self._evaluate_lsq_hazards(
+                phys_addrs=phys_addrs,
+                current_cycle=current_cycle,
+                warp_id=warp_id,
+                active_indices=active_indices,
+                conflicting_op_type=MemOpType.LOAD,
+            )
+            unblock_cycle = max(current_cycle, max_queue_full_stall, self.next_available_store_cycle)
+
+        if unblock_cycle > current_cycle:
+            return self.stall_signal, unblock_cycle
+        return WarpState.WARP_READY, current_cycle
 
     def load(
         self,
@@ -271,21 +419,30 @@ class MemoryResource(AbstractResource):
         mask: Optional[np.ndarray] = None,
     ) -> Tuple[WarpState, int, Optional[List[Optional[InFlightMemOp]]], Optional[np.ndarray]]:
         """
-        Vector memory load operation across 32 SIMD lanes with `WarpState` stall signal routing.
+        Pipelined 2-stage vector memory load operation (`issue` -> `perform_request`):
         
         1. Evaluates LSQ capacity full stall, intra-thread RAW (`STORE -> LOAD`) hazard,
-           and Load Pipe availability (`next_available_load_cycle`).
+           and Stage 1 Load Issue availability (`next_available_load_cycle`).
         2. If `unblock_cycle > current_cycle`:
            Does NOT mutate state; routes `(self.stall_signal, unblock_cycle, None, None)`.
         3. If `unblock_cycle <= current_cycle`:
-           Reserves the Load Pipe at `current_cycle`, enqueues `MemOpType.LOAD` tokens into `self.lsq`,
-           reads memory, and routes `(WarpState.WARP_READY, completion_cycle, mem_tokens, results)`.
+           - Step 1 (`issue_request`): Reserves Stage 1 (`next_available_load_cycle`) for
+             `base_latency` cycles (`issued_cycle = issue_start + base_latency`, `is_issued = True`).
+             A subsequent load B can issue at `issued_cycle` as soon as load A is `is_issued`.
+           - Step 2 (`perform_request`): Requires `is_issued == True` and starts at
+             `req_start = max(issued_cycle, next_available_load_req_cycle)` for `req_lat` cycles,
+             hiding `base_latency` across back-to-back loads.
         """
         addrs = np.asarray(addresses, dtype=np.int64)
         mask_arr = np.ones(len(addrs), dtype=bool) if mask is None else np.asarray(mask, dtype=bool)
+        self.validate_allocated_addresses(addrs[mask_arr])
 
         phys_addrs = self.translate_addresses(addrs)
         active_indices = np.where(mask_arr)[0]
+        if active_indices.size == 0:
+            # Completely masked load evaluates as a 1-cycle NOP bubble.
+            # It neither stalls the warp nor blocks the issue port for subsequent instructions.
+            return WarpState.WARP_READY, current_cycle + 1, [], np.zeros(len(addrs), dtype=np.float32)
 
         max_queue_full_stall, max_raw_ready = self._evaluate_lsq_hazards(
             phys_addrs=phys_addrs,
@@ -300,14 +457,24 @@ class MemoryResource(AbstractResource):
             return self.stall_signal, unblock_cycle, None, None
 
         active_addrs = addrs[mask_arr]
-        latency = self.compute_latency(active_addrs)
-        actual_load_start = self.reserve_load(current_cycle, duration=latency)
-        completion_cycle = actual_load_start + latency
+        req_lat = self.compute_request_latency(active_addrs) if active_addrs.size > 0 else 0
+
+        # Step 1: issue
+        issue_start, issued_cycle, is_issued = self.issue_request(MemOpType.LOAD, current_cycle)
+        # Step 2: perform_request (only executes if is_issued is True, after previous perform_request)
+        req_start, completion_cycle, is_requested = self.perform_request(
+            MemOpType.LOAD, issued_cycle=issued_cycle, is_issued=is_issued, req_lat=req_lat
+        )
 
         mem_tokens = self._enqueue_lsq_tokens(
             op_type=MemOpType.LOAD,
             phys_addrs=phys_addrs,
+            issue_start_cycle=issue_start,
+            issued_cycle=issued_cycle,
+            req_start_cycle=req_start,
             completion_cycle=completion_cycle,
+            is_issued=is_issued,
+            is_requested=is_requested,
             warp_id=warp_id,
             active_indices=active_indices,
         )
@@ -326,22 +493,23 @@ class MemoryResource(AbstractResource):
         mask: Optional[np.ndarray] = None,
     ) -> Tuple[WarpState, int, Optional[List[Optional[InFlightMemOp]]]]:
         """
-        Vector memory store operation across 32 SIMD lanes with `WarpState` stall signal routing.
+        Pipelined 2-stage vector memory store operation (`issue` -> `perform_request`).
         
         Stores are fire-and-forget into the 16-entry LSQ:
-        1. Only stalls the warp at issue if the per-thread LSQ is full (`max_queue_full_stall > current_cycle`),
-           routing `(self.stall_signal, max_queue_full_stall, None)`.
-        2. Otherwise, immediately accepts the store into `self.lsq` with `WarpState.WARP_READY`,
-           while scheduling the Store Pipe writeback after `next_available_store_cycle` and any
-           in-flight `LOAD` to the same address (`WAR` hazard).
-        Returns `(WarpState.WARP_READY, completion_cycle, mem_tokens)`.
+        1. Only stalls the warp at issue if the per-thread LSQ is full (`max_queue_full_stall > current_cycle`).
+        2. Otherwise executes Step 1 (`issue_request`, duration `base_latency`) followed by
+           Step 2 (`perform_request`, duration `req_lat`), hiding `base_latency` across back-to-back stores.
         """
         addrs = np.asarray(addresses, dtype=np.int64)
         vals = np.asarray(values, dtype=np.float32)
         mask_arr = np.ones(len(addrs), dtype=bool) if mask is None else np.asarray(mask, dtype=bool)
+        self.validate_allocated_addresses(addrs[mask_arr])
 
         phys_addrs = self.translate_addresses(addrs)
         active_indices = np.where(mask_arr)[0]
+        if active_indices.size == 0:
+            # Completely masked store evaluates as a 1-cycle NOP bubble.
+            return WarpState.WARP_READY, current_cycle + 1, []
 
         max_queue_full_stall, max_war_ready = self._evaluate_lsq_hazards(
             phys_addrs=phys_addrs,
@@ -355,11 +523,15 @@ class MemoryResource(AbstractResource):
             return self.stall_signal, max_queue_full_stall, None
 
         active_addrs = addrs[mask_arr]
-        latency = self.compute_latency(active_addrs)
+        req_lat = self.compute_request_latency(active_addrs) if active_addrs.size > 0 else 0
 
         store_pipe_ready = max(current_cycle, max_war_ready)
-        actual_store_start = self.reserve_store(store_pipe_ready, duration=latency)
-        completion_cycle = actual_store_start + latency
+        # Step 1: issue
+        issue_start, issued_cycle, is_issued = self.issue_request(MemOpType.STORE, store_pipe_ready)
+        # Step 2: perform_request (only executes if is_issued is True, after previous perform_request)
+        req_start, completion_cycle, is_requested = self.perform_request(
+            MemOpType.STORE, issued_cycle=issued_cycle, is_issued=is_issued, req_lat=req_lat
+        )
 
         for lane_id in active_indices:
             l_id = int(lane_id)
@@ -368,7 +540,12 @@ class MemoryResource(AbstractResource):
         mem_tokens = self._enqueue_lsq_tokens(
             op_type=MemOpType.STORE,
             phys_addrs=phys_addrs,
+            issue_start_cycle=issue_start,
+            issued_cycle=issued_cycle,
+            req_start_cycle=req_start,
             completion_cycle=completion_cycle,
+            is_issued=is_issued,
+            is_requested=is_requested,
             warp_id=warp_id,
             active_indices=active_indices,
         )
@@ -407,6 +584,8 @@ class MemoryResource(AbstractResource):
         super().reset()
         self.next_available_load_cycle = 0
         self.next_available_store_cycle = 0
+        self.next_available_load_req_cycle = 0
+        self.next_available_store_req_cycle = 0
         self.memory.clear()
         self.allocations.clear()
         self.allocated_words = 0
@@ -425,7 +604,7 @@ class DRAMResource(MemoryResource):
     BYTES_PER_WORD = 4
     CAPACITY_WORDS = CAPACITY_BYTES // BYTES_PER_WORD  # 4,294,967,296 words
 
-    def __init__(self, name: str = "DRAM", base_latency: int = 20, request_latency: int = 50):
+    def __init__(self, name: str = "DRAM", base_latency: int = 40, request_latency: int = 50):
         super().__init__(
             name=name,
             base_latency=base_latency,
@@ -468,9 +647,9 @@ class DRAMResource(MemoryResource):
 
         return col, channel, row, rank, bank_group, bank
 
-    def compute_latency(self, addresses: np.ndarray) -> int:
+    def compute_request_latency(self, addresses: np.ndarray) -> int:
         """
-        Compute total access latency for a vector access by counting the number of `DRAM_REQ`s.
+        Compute Stage 2 (`perform_request`) serialized latency by counting the number of `DRAM_REQ`s.
         
         A single `DRAM_REQ` can read up to 32 4B words across up to 8 channels, provided all words in the request target:
           1. A single 8-column burst group (`col >> 3`, i.e., 8 cols of 4B each from a bank row)
@@ -479,16 +658,14 @@ class DRAMResource(MemoryResource):
           4. A single `bank_group` from a DRAM Rank
           5. A single `rank` from the DRAM DIMM
         
-        Total Latency = base_latency + num_dram_reqs * request_latency
+        Request Latency = num_dram_reqs * request_latency
         """
         addrs = np.asarray(addresses, dtype=np.uint64)
         if addrs.size == 0:
-            return self.base_latency
+            return 0
 
         col, channel, row, rank, bank_group, bank = self.decompose_address(addrs)
 
-        # Within each channel, each unique (rank, bank_group, bank, row, col >> 3) stack
-        # requires a separate DRAM_REQ; different channels operate in parallel in the same DRAM_REQ.
         unique_ch_stacks = np.unique(
             np.column_stack((channel, rank, bank_group, bank, row, col >> 3)),
             axis=0,
@@ -496,7 +673,7 @@ class DRAMResource(MemoryResource):
         reqs_per_channel = np.bincount(unique_ch_stacks[:, 0].astype(np.int64), minlength=8)
         num_dram_reqs = int(np.max(reqs_per_channel))
 
-        return self.base_latency + num_dram_reqs * self.request_latency
+        return num_dram_reqs * self.request_latency
 
 
 class SRAMResource(MemoryResource):
@@ -505,8 +682,8 @@ class SRAMResource(MemoryResource):
     
     Inherits from MemoryResource with name="SRAM".
     Models a 32-bank on-chip SRAM where bank conflicts serialize requests.
-    Base latency = 2 cycles. Request latency = 12 cycles per SRAM request wave
-    (best-case conflict-free latency = 2 + 1 * 12 = 14 cycles).
+    Base latency = 6 cycles. Request latency = 8 cycles per SRAM request wave
+    (best-case conflict-free latency = 6 + 1 * 8 = 14 cycles).
     
     Each allocation in SRAM can specify an optional vectorized `index_modifier` callable
     (analogous to `std::transform` over `[0, size)`) that maps logical intra-allocation
@@ -520,8 +697,8 @@ class SRAMResource(MemoryResource):
     def __init__(
         self,
         name: str = "SRAM",
-        base_latency: int = 2,
-        request_latency: int = 12,
+        base_latency: int = 6,
+        request_latency: int = 8,
         size_words: int = DEFAULT_SIZE_WORDS,
     ):
         super().__init__(
@@ -578,9 +755,30 @@ class SRAMResource(MemoryResource):
         """
         if index_modifier is not None and size > 0:
             self.validate_bijection(name, size, index_modifier)
-        allocation = super().alloc(name=name, size=size)
+            
+        if name in self.allocations:
+            raise ValueError(f"Allocation '{name}' already exists in {self.name}.")
+        if self.allocated_words + size > self.capacity_words:
+            raise MemoryError(
+                f"{self.name} capacity exceeded. Requested {size} words, "
+                f"available {self.capacity_words - self.allocated_words} words."
+            )
+            
+        aligned_base = (self._next_alloc_base + 31) & ~31
+        actual_base = aligned_base % (1 << 32)
+        self._next_alloc_base = (actual_base + size) % (1 << 32)
+            
+        allocation = MemoryAllocation(
+            name=name, 
+            base_addr=actual_base, 
+            size=size, 
+            mem_space="sram",
+        )
         if index_modifier is not None:
             allocation.index_modifier = index_modifier
+            
+        self.allocations[name] = allocation
+        self.allocated_words += size
         return allocation
 
     def translate_addresses(self, addresses: np.ndarray) -> np.ndarray:
@@ -614,22 +812,23 @@ class SRAMResource(MemoryResource):
                     )
         return phys_addrs
 
-    def compute_latency(self, addresses: np.ndarray) -> int:
+    def compute_request_latency(self, addresses: np.ndarray) -> int:
         """
-        Compute total access latency for a 32-lane vector access to SRAM using vectorized NumPy operations.
+        Compute Stage 2 (`perform_request`) serialized latency for a 32-lane vector access to SRAM.
         
         Translates logical addresses to physical SRAM addresses via each allocation's index_modifier,
         maps physical addresses to banks (`phys_addrs % 32`), and counts bank conflicts via `np.bincount`.
-        Latency = base_latency (2) + max_bank_conflict * request_latency (12).
-        Best-case (1 request wave, conflict-free): 2 + 1 * 12 = 14 cycles.
+        Request Latency = max_bank_conflict * request_latency (8).
+        Total isolated latency = base_latency (6) + max_bank_conflict * request_latency (8)
+        (best-case 1 wave conflict-free = 6 + 8 = 14 cycles).
         """
         addrs = np.asarray(addresses, dtype=np.int64)
         if addrs.size == 0:
-            return self.base_latency
+            return 0
 
         phys_addrs = self.translate_addresses(addrs)
         banks = phys_addrs % self.NUM_BANKS
         bank_counts = np.bincount(banks, minlength=self.NUM_BANKS)
         max_conflict = int(np.max(bank_counts))
 
-        return self.base_latency + max_conflict * self.request_latency
+        return max_conflict * self.request_latency
