@@ -33,6 +33,7 @@ class TestMMAIntrinsic(unittest.TestCase):
             
             kb.asm("sync")
             
+            kb.trace_start("MMA_Kernel")
             with kb.reg_scope("mma_exec") as scope:
                 d0 = scope.alloc("d0")
                 d1 = scope.alloc("d1")
@@ -80,14 +81,22 @@ class TestMMAIntrinsic(unittest.TestCase):
                 kb.asm("set.imm", r_32, 32.0)
                 kb.asm("add", r_tmp_addr, r_tmp_addr, r_32)
                 kb.asm("dram.st", r_tmp_addr, d1)
+            kb.trace_end("MMA_Kernel")
                 
         # 3. Build Kernel
         from pgpu.sw.kernel import build_kernel
         kernel = build_kernel(mma_test_kernel, num_warps=1, debug=False)
 
+        # --- TRACER INJECTION ---
+        from pgpu.devtools.kernel_tracer import KernelTracer
+        tracer = KernelTracer("mma_8x16_8x8_trace")
+        tracer.attach(device, kernel)
         
         # 4. Launch kernel
-        device.launch(kernel)
+        cycles = device.launch(kernel)
+        
+        # --- TRACER EXPORT ---
+        tracer.export()
         
         # 5. Fetch and verify results
         d_out = device.dram_copy(out_buf, direction=CopyDirection.D2H)
@@ -102,6 +111,7 @@ class TestMMAIntrinsic(unittest.TestCase):
         
         np.testing.assert_allclose(d_out, expected_D_flat, rtol=1e-5)
         print("MMA Intrinsic successfully computed D = A @ B.T + C!")
+        print("Num cycles taken:", cycles)
 
 if __name__ == "__main__":
     unittest.main()
