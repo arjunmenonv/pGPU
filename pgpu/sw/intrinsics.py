@@ -38,10 +38,12 @@ def memset(
     from pgpu.arch.memory import MemoryAllocation
     from pgpu.sw.kernel import WarpKernel
 
-    if isinstance(target, MemoryAllocation):
+    if hasattr(target, "base_addr") and hasattr(target, "size"):
         base_addr = target.base_addr
         num_words = size if size is not None else target.size
         space = (mem_space or getattr(target, "mem_space", "dram")).lower()
+        if hasattr(target, "allocation") and getattr(target.allocation, "mem_space", None) == "sram":
+            space = "sram"
     elif isinstance(target, int):
         if size is None:
             raise ValueError("`size` must be specified when `target` is an integer base address.")
@@ -138,6 +140,18 @@ def emit_mma_8x16_8x8(
 
     with kb.reg_scope("mma_8x16_8x8") as scope:
         # Compute thread's quad coordinates
+        r_a_base = scope.alloc("a_base")
+        if hasattr(a_sram, 'base_addr'):
+            kb.asm("set.imm", r_a_base, float(a_sram.base_addr))
+        else:
+            kb.asm("mov", r_a_base, a_sram)
+
+        r_b_base = scope.alloc("b_base")
+        if hasattr(b_sram, 'base_addr'):
+            kb.asm("set.imm", r_b_base, float(b_sram.base_addr))
+        else:
+            kb.asm("mov", r_b_base, b_sram)
+
         r_row = scope.alloc("row")
         r_col = scope.alloc("col")
         r_thresh = scope.alloc("thresh")
@@ -181,7 +195,7 @@ def emit_mma_8x16_8x8(
 
         # Load A (Q00, Q10, Q01, Q11)
         r_a_base_thread = scope.alloc("a_base_thread")
-        kb.asm("add", r_a_base_thread, a_sram, r_ab_base)
+        kb.asm("add", r_a_base_thread, r_a_base, r_ab_base)
         kb.asm("sram.ld", a_regs[0], r_a_base_thread)
         kb.asm("add", r_tmp_addr, r_a_base_thread, r_64)
         kb.asm("sram.ld", a_regs[1], r_tmp_addr)
@@ -192,7 +206,7 @@ def emit_mma_8x16_8x8(
 
         # Load B (Q00, Q10, Q01, Q11)
         r_b_base_thread = scope.alloc("b_base_thread")
-        kb.asm("add", r_b_base_thread, b_sram, r_ab_base)
+        kb.asm("add", r_b_base_thread, r_b_base, r_ab_base)
         kb.asm("sram.ld", b_regs[0], r_b_base_thread)
         kb.asm("add", r_tmp_addr, r_b_base_thread, r_64)
         kb.asm("sram.ld", b_regs[1], r_tmp_addr)
@@ -212,7 +226,14 @@ def emit_mma_8x16_8x8(
             r_32 = scope.alloc("thirtytwo")
             kb.asm("set.imm", r_32, 32.0)
 
-            kb.asm("add", r_c_base_thread, c_sram, r_c_base)
+            r_c_base_reg = scope.alloc("c_base_reg")
+            if hasattr(c_sram, 'base_addr'):
+                kb.asm("set.imm", r_c_base_reg, float(c_sram.base_addr))
+            else:
+                kb.asm("mov", r_c_base_reg, c_sram)
+
+            kb.asm("add", r_c_base_thread, r_c_base_reg, r_c_base)
+
             kb.asm("sram.ld", c_regs[0], r_c_base_thread)
             kb.asm("add", r_tmp_addr, r_c_base_thread, r_32)
             kb.asm("sram.ld", c_regs[1], r_tmp_addr)
