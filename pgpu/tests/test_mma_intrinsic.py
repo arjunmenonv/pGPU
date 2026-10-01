@@ -11,7 +11,7 @@ class TestMMAIntrinsic(unittest.TestCase):
         # 1. Setup hardware
         dram = DRAMResource(name="DRAM")
         sm0_sram = SRAMResource(name="SRAM_0")
-        smsp0 = SMSP(num_warps=1)
+        smsp0 = SMSP(num_warps=4)
         sm0 = SM(sm_id=0, sram=sm0_sram, smsps=[smsp0])
         device = pGPU(name="pGPU", dram=dram, sms=[sm0])
         out_buf = device.dram_alloc("out_buf", 64)
@@ -25,15 +25,20 @@ class TestMMAIntrinsic(unittest.TestCase):
             a_sram = kb.sram.alloc("A", 128)
             b_sram = kb.sram.alloc("B", 128)
             c_sram = kb.sram.alloc("C", 64)
+
+            kb.trace_start("MMA_Kernel")
             
+
             # Initialize SRAM with memset
             memset(kb, a_sram, value=val_a)
             memset(kb, b_sram, value=val_b)
             memset(kb, c_sram, value=val_c)
             
             kb.asm("sync")
+            p_w0_only = kb.alloc_pred("p_w0_only")
+            kb.asm("cmp.eq", p_w0_only, kb.sr_warpid, kb.rz)
+            kb.asm("jmp", "end_kernel", pred=p_w0_only, pred_inv=True)
             
-            kb.trace_start("MMA_Kernel")
             with kb.reg_scope("mma_exec") as scope:
                 d0 = scope.alloc("d0")
                 d1 = scope.alloc("d1")
@@ -72,20 +77,29 @@ class TestMMAIntrinsic(unittest.TestCase):
                 
                 r_tmp_addr = scope.alloc("tmp_addr")
                 
-                # Write Q00 (d0)
-                kb.asm("add", r_tmp_addr, r_dram_base, r_c_base)
-                kb.asm("dram.st", r_tmp_addr, d0)
-                
-                # Write Q10 (d1) (offset +32)
+                # Calculate global_tid for predication
                 r_32 = scope.alloc("thirtytwo")
                 kb.asm("set.imm", r_32, 32.0)
+                r_global_tid = scope.alloc("global_tid")
+                kb.asm("fma", r_global_tid, kb.sr_warpid, r_32, kb.sr_laneid)
+                
+                # Predicate p_w0: global_tid < 32 (only Warp 0 writes)
+                p_w0 = scope.alloc_pred("p_w0")
+                kb.asm("cmp.lt", p_w0, r_global_tid, r_32)
+
+                # Write Q00 (d0)
+                kb.asm("add", r_tmp_addr, r_dram_base, r_c_base)
+                kb.asm("dram.st", r_tmp_addr, d0, pred=p_w0)
+                
+                # Write Q10 (d1) (offset +32)
                 kb.asm("add", r_tmp_addr, r_tmp_addr, r_32)
-                kb.asm("dram.st", r_tmp_addr, d1)
+                kb.asm("dram.st", r_tmp_addr, d1, pred=p_w0)
             kb.trace_end("MMA_Kernel")
+            kb.label("end_kernel")
                 
         # 3. Build Kernel
         from pgpu.sw.kernel import build_kernel
-        kernel = build_kernel(mma_test_kernel, num_warps=1, debug=False)
+        kernel = build_kernel(mma_test_kernel, num_warps=4, debug=False)
 
         # --- TRACER INJECTION ---
         from pgpu.devtools.kernel_tracer import KernelTracer

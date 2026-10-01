@@ -246,3 +246,67 @@ def emit_mma_8x16_8x8(
     return kb.instructions[start_idx:]
 
 mma_8x16_8x8 = emit_mma_8x16_8x8
+
+def emit_warp_reduce(
+    kb: "WarpKernel",
+    sram_buf: Any,
+    op: str = "add"
+) -> List["Instruction"]:
+    """
+    Intrinsic for a warp-wide parallel tree reduction in shared memory.
+    
+    Args:
+        kb: WarpKernel builder.
+        sram_buf: VirtualReg or MemoryAllocation pointing to a 32-element SRAM buffer.
+        op: The reduction operation to perform ("add", "max", "min"). Defaults to "add".
+            The final reduced data sits in element 0 of the SRAM buffer.
+    """
+    start_idx = len(kb.instructions)
+
+    with kb.reg_scope("warp_reduce") as scope:
+        r_base = scope.alloc("base")
+        if hasattr(sram_buf, 'base_addr'):
+            kb.asm("set.imm", r_base, float(sram_buf.base_addr))
+        else:
+            kb.asm("mov", r_base, sram_buf)
+
+        r_tid = kb.sr_laneid
+
+        # For each stride in [16, 8, 4, 2, 1]
+        for stride in [16.0, 8.0, 4.0, 2.0, 1.0]:
+            r_stride = scope.alloc(f"stride_{int(stride)}")
+            kb.asm("set.imm", r_stride, stride)
+
+            # Active threads: tid < stride
+            p_active = scope.alloc_pred(f"p_active_{int(stride)}")
+            kb.asm("cmp.lt", p_active, r_tid, r_stride)
+
+            # addr1 = base + tid
+            r_addr1 = scope.alloc(f"addr1_{int(stride)}")
+            kb.asm("add", r_addr1, r_base, r_tid, pred=p_active)
+
+            # addr2 = base + tid + stride
+            r_addr2 = scope.alloc(f"addr2_{int(stride)}")
+            r_tid_plus_stride = scope.alloc(f"tid_plus_stride_{int(stride)}")
+            kb.asm("add", r_tid_plus_stride, r_tid, r_stride, pred=p_active)
+            kb.asm("add", r_addr2, r_base, r_tid_plus_stride, pred=p_active)
+
+            # Load val1, val2
+            r_val1 = scope.alloc(f"val1_{int(stride)}")
+            r_val2 = scope.alloc(f"val2_{int(stride)}")
+            kb.asm("sram.ld", r_val1, r_addr1, pred=p_active)
+            kb.asm("sram.ld", r_val2, r_addr2, pred=p_active)
+
+            # Compute op
+            r_res = scope.alloc(f"res_{int(stride)}")
+            kb.asm(op, r_res, r_val1, r_val2, pred=p_active)
+
+            # Store result
+            kb.asm("sram.st", r_addr1, r_res, pred=p_active)
+
+            # Sync warp before next step since write/read threads overlap in next step
+            kb.asm("sync.warp")
+
+    return kb.instructions[start_idx:]
+
+warp_reduce = emit_warp_reduce
