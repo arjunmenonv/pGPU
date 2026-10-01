@@ -112,7 +112,7 @@ The simulator uses a naive round-robin scheduling algorithm to switch between wa
 
 #### 3. How should I approach this problem?
 
-1. Read the [docs]() (TBD) and go through the files in the [pgpu/sw](https://github.com/arjunmenonv/pGPU/tree/main/pgpu/sw) folder to get a hold of the simulator features and the software APIs around it.
+1. Go through the files in the [pgpu/sw](https://github.com/arjunmenonv/pGPU/tree/main/pgpu/sw) and the [pgpu/arch](https://github.com/arjunmenonv/pGPU/tree/main/pgpu/arch) folders to get a hold of the simulator features and the software APIs around it.
 
 2. Read the [ISA](https://github.com/arjunmenonv/pGPU/tree/main/pgpu/arch/isa.py)! You might find unconventional instructions here that might come in handy for your kernel.
 
@@ -143,9 +143,11 @@ The following points are gated by the official AI usage and honor code for the C
 
 `pGPU` Simulator: [arjunmenonv/pGPU](https://github.com/arjunmenonv/pGPU/tree/main/)
 
-docs: [docs](https://github.com/arjunmenonv/pGPU/tree/main/docs)
+docs (this document): [docs](https://github.com/arjunmenonv/pGPU/tree/main/docs)
 
-example kernels: [vector-add](https://github.com/arjunmenonv/pGPU/tree/main/pgpu/examples/vector_add.py), [intrinsic-demo](https://github.com/arjunmenonv/pGPU/tree/main/pgpu/examples/intrinsic_demo.py)
+example kernels: [vector-add](https://github.com/arjunmenonv/pGPU/tree/main/pgpu/examples/vector_add.py), [intrinsic-demo](https://github.com/arjunmenonv/pGPU/tree/main/pgpu/examples/intrinsic_demo.py), [warp-reduce](https://github.com/arjunmenonv/pGPU/tree/main/pgpu/tests/test_reduction.py), [matrix-multiply-accumulate](https://github.com/arjunmenonv/pGPU/tree/main/pgpu/tests/test_mma_intrinsic.py)
+
+Read the simulator [code](https://github.com/arjunmenonv/pGPU/tree/main/pgpu/arch). Code and commit histories will tell you stories that volumes of documentation forget to capture!
 
 
 <hr style="opacity: 0.6;">
